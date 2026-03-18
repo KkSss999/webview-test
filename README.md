@@ -1,38 +1,38 @@
-# Windows Tauri2 桌面应用无头 E2E 成功案例
+# 跨平台 (Windows/macOS) Tauri2 桌面应用无头 E2E 测试方案
 
-本项目用于在 Windows 环境通过 CDP 控制“已启动”的 Tauri2 桌面应用，完成无头端到端测试。  
+本项目用于在 Windows 和 macOS 环境下，对“已启动”的 Tauri2 桌面应用进行端到端无头自动化测试。  
 测试重点是完整用户行为，而不是直接调用 Rust command。
+
+本项目的最大特色是**完全摒弃 Selenium，纯基于 Playwright 驱动**，同时完美兼容底层的 CDP 协议（Windows）与 W3C WebDriver 协议（macOS）。
 
 ## 测试目标
 
 - 连接已启动的 Tauri2 桌面应用
 - 检查首页可正常渲染
 - 检查控制台无关键报错（尤其是 invoke 未注入类错误）
-- 自动提取可点击元素并逐步点击
+- 自动提取可点击元素并逐步点击（自带防 Stale Element 重渲染抵抗机制）
 - 每一步点击后检查错误并返回首页继续下一步
 - 最终输出累计 `console_errors/page_errors`
 
-## 当前脚本
+## 架构特性
 
 - 单一入口：`main.py`
-- 不依赖 `test_tauri_bridge.py` / `test_desktop_e2e.py`
-- 直接运行即可完成完整 E2E 循环
+- **零 Selenium 依赖**：使用 Playwright 原生 CDP 控制 Windows，使用 Playwright HTTP Client 模拟 WebDriver 控制 macOS。
+- **高阶 WebDriver 能力**：通过深度 JS 注入，在 macOS 实现了原本 WebDriver 不支持的 **全局 Console 错误监听** 与 **实时元素寻址 (防 Stale Element)**。
 
 ## 环境要求
 
 - Python 3.13+
-- `uv`
-- **Playwright** Chromium（CDP 模式）
-- **Selenium**（WebDriver 模式）
+- `uv` 包管理器
+- **Playwright** (`uv pip install playwright`)
 - 已启动的 Tauri2 桌面应用
 
-### 平台特定
+### 平台特定机制
 
-| 平台 | 协议 | 默认端口 | 依赖 |
+| 平台 | 协议 | 默认端口 | 底层连接方式 |
 |------|------|----------|------|
-| Windows | CDP (WebView2) | 9222 | Playwright |
-| macOS | WebDriver (tauri-plugin-webdriver) | 4445 | Selenium |
-| Linux | CDP (WebKitGTK) | 9222 | Playwright |
+| Windows | CDP (WebView2) | 9222 | Playwright `connect_over_cdp` |
+| macOS | WebDriver (tauri-plugin-webdriver) | 4445 | Playwright `APIRequestContext` 模拟 |
 
 ## 安装
 
@@ -40,7 +40,7 @@
 # 安装依赖
 uv sync
 
-# 安装 Playwright 浏览器（CDP 模式需要）
+# 安装 Playwright 浏览器（仅 CDP 模式需要）
 uv run playwright install chromium
 ```
 
@@ -49,33 +49,15 @@ uv run playwright install chromium
 连接已启动应用执行无头 E2E：
 
 ```bash
-# macOS WebDriver (tauri-plugin-webdriver)
+# macOS WebDriver 模式 (依赖应用内开启 tauri-plugin-webdriver)
 uv run python main.py --driver webdriver --endpoint http://127.0.0.1:4445 --expect-selector body --min-count 1 --max-click-targets 8
 
-# Windows CDP (WebView2) - 和之前一样
+# Windows CDP 模式 (依赖 WebView2 开启远程调试)
 uv run python main.py --driver cdp --endpoint http://127.0.0.1:9222 --expect-selector body --min-count 1 --max-click-targets 8
 
-# 自动检测
+# 自动检测 (按端点存活状态自动选择协议)
 uv run python main.py --driver auto
 ```
-
-
-## 参数说明
-
-- `--endpoint`：CDP 地址，默认 `http://127.0.0.1:9222`
-- `--title-keyword`：目标页面标题关键字，可重复
-- `--url-keyword`：目标页面 URL 关键字，可重复
-- `--timeout-ms`：整体等待超时
-- `--expect-selector`：渲染成功的关键选择器
-- `--min-count`：关键选择器最小数量
-- `--expect-text`：页面必须出现的文本，可重复
-- `--home-selector`：回首页按钮选择器（回退失败时兜底）
-- `--max-click-targets`：自动点击最大目标数
-- `--click-wait-ms`：每次点击后等待时长
-- `--forbid-console-pattern`：禁用错误模式，可重复
-- `--app-cmd`：可选，测试前启动应用命令
-- `--app-cwd`：可选，应用启动目录
-- `--app-start-wait-ms`：应用启动后等待时长
 
 ## 默认错误拦截
 
@@ -98,51 +80,24 @@ uv run python main.py --forbid-console-pattern "TypeError" --forbid-console-patt
 - `Tauri invoke` 状态就绪（兼容 `__TAURI__` 与 `__TAURI_INTERNALS__`）
 - 首页渲染断言通过
 - 点击循环执行完成且无失败步骤
-- `console_errors` 与 `page_errors` 未命中禁用模式
-
-末尾输出示例：
-
-```json
-{"selector":"body","count":1,"click_steps":8,"failed_steps":0}
-{"console_errors":[],"page_errors":[]}
-```
-
-## 已验证结果
-
-### Windows
-
-- 已成功识别并输出导航与业务按钮（IDEA/TODO/仪表盘/设置/同步/新建想法等）
-- 自动点击循环完成
-- 累计报错为空
-
-### macOS
-
-- 已成功连接 WebDriver (tauri-plugin-webdriver)
-- Tauri invoke 状态就绪
-- 自动点击循环完成
-- 最终输出：`页面渲染成功，点击循环完成，未发现禁用报错`
+- 控制台未命中禁用模式
 
 ## 排障
 
-### CDP 模式（Windows）
+### Windows (CDP 模式)
 
 CDP 不可达时先检查：
-
-```bash
+```powershell
 Invoke-RestMethod http://127.0.0.1:9222/json/version
-Invoke-RestMethod http://127.0.0.1:9222/json/list
 ```
+若只连接到 `localhost:1420` 前端页，可能出现 invoke 未注入报错。应确保连接的是 Tauri 启动的真实 App。
 
-若只连接到 `localhost:1420` 前端页，可能出现 invoke 未注入报错。应确保测试连接的是已启动桌面应用对应的 WebView2 目标页。
+### macOS (WebDriver 模式)
 
-### WebDriver 模式（macOS）
-
-确保 Tauri 应用已配置 `tauri-plugin-webdriver`：
-
+确保 Tauri 应用在 debug 构建中已配置 `tauri-plugin-webdriver`：
 ```bash
 # 检查 WebDriver 是否运行
 curl http://127.0.0.1:4445/status
-# 应返回: {"value":{"ready":true,"message":"tauri-plugin-webdriver is ready"}}
+# 应返回 ready 状态
 ```
-
-详见 [WEBDRIVER_INSTALL.md](https://github.com/maoyi-dev/GoldenIdea/blob/main/WEBDRIVER_INSTALL.md)
+如果在点击时出现异常，多半是目标元素不可见或前端发生阻塞，脚本内部已内置针对 React/Vue 重渲染的 Stale Element 抵抗机制。

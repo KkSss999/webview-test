@@ -1,219 +1,77 @@
-# Windows Tauri2 桌面应用无头自动化测试技术报告
+# 跨平台 (Windows/macOS) Tauri2 桌面应用无头自动化测试技术报告
 
 ## 1. 背景与目标
 
-在 Windows 平台上使用 Tauri2 开发桌面应用时，传统的 `localhost:1420` 前端开发服务器存在一个根本性问题：**该端口仅提供前端页面渲染，无法访问 Rust 侧功能**。这会导致以下典型错误：
+在开发 Tauri2 桌面应用时，传统的 `localhost:1420` 前端开发服务器存在一个根本性问题：**该端口仅提供前端页面渲染，无法访问 Rust 侧功能**。这会导致典型的前端 invoke 报错。为了进行真实的端到端测试，必须连接到已启动的、完整的桌面应用实例。
 
-```
-[API Error] unknown: TypeError: Cannot read properties of undefined (reading 'invoke')
-    at tauriApi.js:149:29
-```
+然而，在跨平台场景下，遇到了极大的技术壁垒：
+1. **Windows** 底层是基于 Chromium 的 WebView2，天然支持强大的 CDP (Chrome DevTools Protocol)。
+2. **macOS** 底层是 Apple 的 WKWebView，完全不支持 CDP，只支持通过特定插件（如 `tauri-plugin-webdriver`）暴露有限的 W3C WebDriver 协议。
 
-该错误的根本原因是 `window.__TAURI__` 未被注入——因为 1420 端口不经过 Tauri 运行时。本报告旨在提供一种通过 **CDP (Chrome DevTools Protocol)** 连接已启动的 Tauri2 桌面应用进行完整自动化测试的方案。
+本报告旨在提供一种**纯 Playwright 驱动**的跨平台统一测试方案，它不仅完美桥接了两种底层协议，还通过深度定制突破了 macOS 原生 WebDriver 的种种限制。
 
 ## 2. 核心技术方案
 
-### 2.1 连接方式
+### 2.1 架构设计
 
-通过 WebView2 的远程调试端口 (`--remote-debugging-port`) 建立 CDP 连接，而非传统的 `localhost:1420`。这使得测试脚本可以直接操作已启动的完整桌面应用实例，Rust 侧功能正常可用。
+| 平台 | 底层引擎 | 通信协议 | 客户端实现方式 |
+|------|----------|----------|----------------|
+| Windows | WebView2 (Chromium) | CDP (端口 9222) | Playwright 原生 `connect_over_cdp` |
+| macOS | WKWebView (WebKit) | WebDriver (端口 4445) | Playwright HTTP `APIRequestContext` 模拟 |
 
-### 2.2 技术栈
+**方案亮点**：完全移除了沉重的 Selenium 依赖。对于 macOS 平台，直接利用 Playwright 强大的异步 HTTP 客户端功能，手工封装了一个微型、轻量级的 WebDriver 客户端，从而在代码层面统一了测试工具栈。
 
-| 组件 | 用途 |
-|------|------|
-| Python 3.13+ | 测试脚本运行环境 |
-| Playwright | CDP 连接与自动化操作 |
-| WebView2 (Windows) | Tauri2 底层渲染引擎 |
-| CDP (DevTools Protocol) | 浏览器/应用远程控制协议 |
+### 2.2 macOS (WebDriver) 模式的高阶突破
 
-### 2.3 Tauri v2 兼容性处理
+原生的 WebDriver 协议在测试现代前端框架（如 React/Vue）时存在两个致命缺陷，本方案通过“**JS 代码级注入**”完美解决：
 
-Tauri v2 在未启用 `withGlobalTauri` 配置时，`window.__TAURI__` 全局对象可能不存在。测试脚本需兼容三种 invoke 访问路径：
+#### 突破 1：全局 Console 错误监听
+**痛点**：W3C WebDriver 标准对 WKWebView 的日志捕获支持极差，无法像 CDP 那样直接监听 `console.error`。
+**解法**：在确认 Tauri 就绪后，通过 `execute_script` 向页面注入“内鬼”代码，劫持全局的 `console.error`、`window.onerror` 和 `unhandledrejection`，将错误存入全局数组 `window.__E2E_ERRORS__`。Python 脚本在每次点击后实时读取该数组，实现了等价于 CDP 的报错拦截能力。
 
-| 位置 | 检测方式 |
-|------|----------|
-| `window.__TAURI__.invoke` | root 模式 |
-| `window.__TAURI__.core.invoke` | core 模式 |
-| `window.__TAURI_INTERNALS__.invoke` | internals 模式（v2 常见）|
+#### 突破 2：防 "Stale Element Reference" (陈旧元素引用)
+**痛点**：WebDriver 默认返回静态绑定的内存元素 ID，一旦前端因点击发生重渲染，旧 ID 立刻失效并抛出 `Stale Element` 异常。
+**解法**：废弃直接收集元素 ID 的做法。注入一段高级 JS 算法 (`cssPath`)，为页面上每个可点击元素逆向推导出一根**绝对唯一的 CSS 选择器路径**。在执行点击时，脚本采用**延迟求值 (Lazy Evaluation)** 策略，拿着这条路径去实时查询最新的 DOM 节点并点击。这完全模仿了 Playwright 官方 Locator 的黑科技。
 
 ## 3. 测试流程设计
 
-### 3.1 完整自动化测试流程
-
 ```
-1. 启动/连接 CDP 端点
+1. 识别并连接协议端点 (CDP 或 WebDriver)
          ↓
-2. 查找目标页面（按标题/URL 关键字）
+2. 查找目标页面并等待加载完成
          ↓
-3. 等待页面加载完成
+3. 检测 Tauri invoke 是否就绪（兼容 v2 的三路径探测）
          ↓
-4. 检测 Tauri invoke 是否就绪（三路径探测）
+4. (仅 Mac) 注入 JS 错误拦截器与 CSS 寻址算法
          ↓
-5. 渲染断言（选择器数量、文本内容）
+5. 渲染断言（确认关键选择器数量满足要求）
          ↓
-6. 收集可点击元素并遍历点击
+6. 提取元素的精确 CSS 路径并放入点击队列
          ↓
-7. 每一步点击后检查控制台错误
+7. 遍历点击（实时寻址防 Stale Element）
          ↓
-8. 尝试返回首页，继续下一步
+8. 提取拦截到的 console_errors 校验并尝试返回首页
          ↓
-9. 汇总错误，输出测试结论
+9. 汇总所有错误，输出 JSON 测试结论
 ```
 
-### 3.2 关键检测点
+## 4. 实测验证结果
 
-- **CDP 连接成功**：确认已连接到真实桌面应用而非纯前端
-- **Tauri invoke 就绪**：验证 Rust 侧通道可用
-- **渲染成功**：页面元素正常渲染，数据来自 SQLite
-- **无控制台错误**：拦截 `[API Error]` 和 `invoke undefined` 类错误
-- **点击循环完成**：所有可交互元素可点击且无异常
+### 4.1 Windows (CDP)
+- 成功识别页面并获取 8 个业务按钮。
+- Playwright 原生 Locator 点击顺畅，无 Stale Element 问题。
+- 原生 Console 监听准确捕获所有前端异常。
 
-## 4. 核心代码实现
+### 4.2 macOS (WebDriver)
+- **环境**：需在 Tauri 的 `main.rs` 的 debug 构建中挂载 `tauri_plugin_webdriver` 插件。
+- 成功建立 HTTP Session 握手。
+- JS 拦截器成功拦截了 Vue 路由级别的 `unhandledrejection` 报错。
+- 基于精确 CSS 路径的实时寻址点击，完美抵抗了 Vue 组件频繁销毁重建带来的 `Stale Element Reference` 崩溃。
+- 测试流程顺畅跑完，最终输出结构化测试报告。
 
-### 4.1 Tauri invoke 就绪检测
+## 5. 总结
 
-```python
-def wait_tauri_ready(page: Page, timeout_ms: int) -> bool:
-    location = page.evaluate(
-        "() => { "
-        "  const api = globalThis.__TAURI__; "
-        "  const internals = globalThis.__TAURI_INTERNALS__; "
-        "  if (api && typeof api.invoke === 'function') return 'root'; "
-        "  if (api && api.core && typeof api.core.invoke === 'function') return 'core'; "
-        "  if (internals && typeof internals.invoke === 'function') return 'internals'; "
-        "  return 'missing'; "
-        "}"
-    )
-    return location in {"root", "core", "internals"}
-```
-
-### 4.2 可点击元素自动收集
-
-```python
-def collect_click_targets(page, limit: int):
-    return page.evaluate(
-        """({ limit }) => {
-          const selector = 'button, a, [role="button"], input[type="button"]';
-          const all = Array.from(document.querySelectorAll(selector));
-          // 过滤不可见元素，计算 CSS 路径，返回 {selector, tag, text}
-        }"""
-    )
-```
-
-### 4.3 循环点击与错误检测
-
-```python
-for item in targets:
-    page.click(item["selector"])
-    page.wait_for_timeout(click_wait_ms)
-    # 检查新增 console/page 错误
-    if new_errors > 0:
-        report["ok"] = False
-    return_home(page, home_url, home_selector)
-```
-
-## 5. 实测验证结果
-
-### 5.1 测试环境
-
-- **操作系统**：Windows
-- **应用**：GoldenIdea (Tauri2 + Vue 3)
-- **CDP 端口**：9222
-- **Python**：3.13+
-
-### 5.2 测试命令
-
-```bash
-python main.py --endpoint http://127.0.0.1:9222 --expect-selector body --min-count 1 --max-click-targets 8
-```
-
-### 5.3 输出结果
-
-```
-已连接，当前上下文数量: 1
-- 页面: title='Tauri + Vue 3 App' url='http://localhost:1420/idea'
-命中目标页面: title='Tauri + Vue 3 App'
-Tauri invoke 已就绪，位置: internals
-
-可点击目标列表:
-1. button | (no-text) | #app > div > aside > div:nth-of-type(1) > button
-2. a | IDEA | #app > div > aside > div:nth-of-type(3) > nav > a:nth-of-type(1)
-3. a | TODO | #app > div > aside > div:nth-of-type(3) > nav > a:nth-of-type(2)
-4. a | 仪表盘 | #app > div > aside > div:nth-of-type(3) > nav > a:nth-of-type(3)
-5. a | 设置 | #app > div > aside > div:nth-of-type(3) > nav > a:nth-of-type(4)
-6. a | 同步 | #app > div > aside > div:nth-of-type(3) > nav > a:nth-of-type(5)
-7. button | 新建想法 | main > div > div > div:nth-of-type(1) > div > button
-8. button | (no-text) | div:nth-of-type(2) > div > div > div:nth-of-type(1) > div:nth-of-type(2) > button
-
-{"selector": "body", "count": 1, "click_steps": 8, "failed_steps": 0}
-累计控制台错误:
-{"console_errors": [], "page_errors": []}
-✅ 页面渲染成功，点击循环完成，未发现禁用报错
-```
-
-### 5.4 验证结论
-
-| 验证项 | 状态 |
-|--------|------|
-| CDP 连接已启动 Tauri2 | ✅ 通过 |
-| Playwright 方式连接 | ✅ 通过 |
-| 前端页面渲染 | ✅ 通过 |
-| Rust 侧通道可用 (internals) | ✅ 通过 |
-| 自动点击遍历 (8 个目标) | ✅ 通过 |
-| 控制台错误检测 | ✅ 无错误 |
-| 禁用模式拦截 | ✅ 未命中 |
-
-## 6. 参数说明
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--endpoint` | CDP 调试端点 | `http://127.0.0.1:9222` |
-| `--title-keyword` | 页面标题关键字 | `GoldenIdea` |
-| `--url-keyword` | URL 关键字 | `tauri://`, `localhost:1420` |
-| `--expect-selector` | 渲染断言选择器 | `body` |
-| `--min-count` | 最小元素数量 | 1 |
-| `--expect-text` | 页面必须包含的文本 | [] |
-| `--max-click-targets` | 最大点击元素数量 | 25 |
-| `--click-wait-ms` | 点击后等待毫秒数 | 700 |
-| `--forbid-console-pattern` | 禁用的错误模式 | `[API Error]`, `invoke undefined` |
-| `--app-cmd` | 启动应用的命令行 | - |
-| `--app-cwd` | 应用工作目录 | - |
-| `--app-start-wait-ms` | 启动后等待毫秒数 | 8000 |
-
-## 7. 常见问题
-
-### Q1: 连接失败 `ECONNREFUSED`
-
-**原因**：Tauri 应用未开启远程调试端口
-
-**解决**：启动应用时添加参数
-```bash
-set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222
-your-tauri-app.exe
-```
-
-### Q2: 页面已找到但 `__TAURI__.invoke` 未就绪
-
-**原因**：使用的是 `localhost:1420` 而非真实桌面应用
-
-**解决**：
-1. 确保通过 CDP 连接已启动的桌面应用
-2. Tauri v2 未开启 `withGlobalTauri` 时全局 API 不可见属正常，脚本已兼容 `__TAURI_INTERNALS__`
-
-### Q3: 报错 `Command xxx not found`
-
-**原因**：命令名为 Rust `#[tauri::command]` 注册名，非应用名
-
-**说明**：本测试方案不直接调用 Rust 命令，仅验证页面行为和错误
-
-## 8. 总结
-
-本方案成功实现了以下目标：
-
-1. **绕过 1420 端口限制**：通过 CDP 连接真实桌面应用实例
-2. **Rust 侧功能可用**：`__TAURI_INTERNALS__.invoke` 确保通道可达
-3. **端到端行为测试**：不依赖特定 Rust 命令，以页面渲染和交互作为验证依据
-4. **自动化错误检测**：自动遍历点击元素并拦截控制台报错
-5. **可集成至 LLM 测试流程**：输出结构化 JSON 结果，易于程序解析
-
-该方案已在 Windows + Tauri2 + Vue 3 项目中验证通过，可作为类似技术栈的自动化测试参考。
+本方案不仅成功绕过了 `localhost:1420` 无法测试 Rust 侧代码的限制，更在行业内极少有人涉足的 **“Mac 端 Tauri WKWebView 自动化”** 领域给出了教科书级别的解法：
+- 抛弃 Selenium，用一套 Playwright 搞定双协议。
+- 利用 JS 注入降维打击了 WebDriver 协议的底层缺陷（日志盲区与静态 ID）。
+- 生成了极度稳定、抗重渲染的 E2E 循环点击基建。
