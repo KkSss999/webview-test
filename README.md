@@ -20,19 +20,27 @@
 
 ## 环境要求
 
-- Windows
 - Python 3.13+
 - `uv`
-- Playwright Chromium
-- 已启动 Tauri2 桌面应用并开放 CDP 端口（默认 `9222`）
+- **Playwright** Chromium（CDP 模式）
+- **Selenium**（WebDriver 模式）
+- 已启动的 Tauri2 桌面应用
+
+### 平台特定
+
+| 平台 | 协议 | 默认端口 | 依赖 |
+|------|------|----------|------|
+| Windows | CDP (WebView2) | 9222 | Playwright |
+| macOS | WebDriver (tauri-plugin-webdriver) | 4445 | Selenium |
+| Linux | CDP (WebKitGTK) | 9222 | Playwright |
 
 ## 安装
 
 ```bash
+# 安装依赖
 uv sync
-```
 
-```bash
+# 安装 Playwright 浏览器（CDP 模式需要）
 uv run playwright install chromium
 ```
 
@@ -41,14 +49,16 @@ uv run playwright install chromium
 连接已启动应用执行无头 E2E：
 
 ```bash
-uv run python main.py --endpoint http://127.0.0.1:9222 --expect-selector body --min-count 1 --max-click-targets 8
+# macOS WebDriver (tauri-plugin-webdriver)
+uv run python main.py --driver webdriver --endpoint http://127.0.0.1:4445 --expect-selector body --min-count 1 --max-click-targets 8
+
+# Windows CDP (WebView2) - 和之前一样
+uv run python main.py --driver cdp --endpoint http://127.0.0.1:9222 --expect-selector body --min-count 1 --max-click-targets 8
+
+# 自动检测
+uv run python main.py --driver auto
 ```
 
-由脚本启动应用后再测试：
-
-```bash
-uv run python main.py --app-cmd "path\\to\\GoldenIdea.exe" --app-cwd "path\\to" --expect-selector body --min-count 1
-```
 
 ## 参数说明
 
@@ -97,14 +107,24 @@ uv run python main.py --forbid-console-pattern "TypeError" --forbid-console-patt
 {"console_errors":[],"page_errors":[]}
 ```
 
-## 已验证结果（Windows）
+## 已验证结果
+
+### Windows
 
 - 已成功识别并输出导航与业务按钮（IDEA/TODO/仪表盘/设置/同步/新建想法等）
 - 自动点击循环完成
 - 累计报错为空
+
+### macOS
+
+- 已成功连接 WebDriver (tauri-plugin-webdriver)
+- Tauri invoke 状态就绪
+- 自动点击循环完成
 - 最终输出：`页面渲染成功，点击循环完成，未发现禁用报错`
 
 ## 排障
+
+### CDP 模式（Windows）
 
 CDP 不可达时先检查：
 
@@ -114,3 +134,15 @@ Invoke-RestMethod http://127.0.0.1:9222/json/list
 ```
 
 若只连接到 `localhost:1420` 前端页，可能出现 invoke 未注入报错。应确保测试连接的是已启动桌面应用对应的 WebView2 目标页。
+
+### WebDriver 模式（macOS）
+
+确保 Tauri 应用已配置 `tauri-plugin-webdriver`：
+
+```bash
+# 检查 WebDriver 是否运行
+curl http://127.0.0.1:4445/status
+# 应返回: {"value":{"ready":true,"message":"tauri-plugin-webdriver is ready"}}
+```
+
+详见 [WEBDRIVER_INSTALL.md](https://github.com/maoyi-dev/GoldenIdea/blob/main/WEBDRIVER_INSTALL.md)

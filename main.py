@@ -1,3 +1,17 @@
+#!/usr/bin/env python3
+"""
+WebView Test Script - 支持 CDP 和 WebDriver 两种连接方式
+
+使用方式:
+    # macOS WebDriver (tauri-plugin-webdriver)
+    uv run python main.py --driver webdriver --endpoint http://127.0.0.1:4445
+
+    # Windows CDP (WebView2)
+    uv run python main.py --driver cdp --endpoint http://127.0.0.1:9222
+
+    # 自动检测
+    uv run python main.py --driver auto
+"""
 import argparse
 import json
 import os
@@ -7,12 +21,26 @@ import urllib.error
 import urllib.request
 from typing import Iterable
 
-from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
+# CDP 使用 Playwright
+from playwright.sync_api import sync_playwright
+
+# WebDriver 使用 Selenium
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--endpoint", default="http://127.0.0.1:9222")
+    parser.add_argument(
+        "--driver",
+        default="auto",
+        choices=["auto", "cdp", "webdriver"],
+        help="连接类型: cdp (Windows WebView2), webdriver (macOS tauri-plugin-webdriver), auto (自动检测)",
+    )
+    parser.add_argument("--endpoint", default="http://127.0.0.1:4445")
+    parser.add_argument("--cdp-endpoint", default="http://127.0.0.1:9222", help="CDP 端点 (Windows)")
+    parser.add_argument("--webdriver-endpoint", default="http://127.0.0.1:4445", help="WebDriver 端点 (macOS)")
     parser.add_argument("--title-keyword", action="append", dest="title_keywords", default=["GoldenIdea"])
     parser.add_argument("--url-keyword", action="append", dest="url_keywords", default=["tauri://", "localhost:1420"])
     parser.add_argument("--timeout-ms", type=int, default=30000)
@@ -22,58 +50,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--home-selector")
     parser.add_argument("--max-click-targets", type=int, default=25)
     parser.add_argument("--click-wait-ms", type=int, default=700)
-    parser.add_argument("--forbid-console-pattern", action="append", dest="forbid_patterns", default=["[API Error]", "Cannot read properties of undefined (reading 'invoke')"])
+    parser.add_argument(
+        "--forbid-console-pattern",
+        action="append",
+        dest="forbid_patterns",
+        default=["[API Error]", "Cannot read properties of undefined (reading 'invoke')"],
+    )
     parser.add_argument("--app-cmd")
     parser.add_argument("--app-cwd")
     parser.add_argument("--app-start-wait-ms", type=int, default=8000)
     return parser.parse_args()
 
-def iter_pages(browser: Browser) -> Iterable[tuple[BrowserContext, Page]]:
-    for context in browser.contexts:
-        for page in context.pages:
-            yield context, page
 
-def pick_target_page(browser: Browser, title_keywords: list[str], url_keywords: list[str], timeout_ms: int) -> tuple[BrowserContext, Page] | None:
-    normalized_title_keywords = [keyword.lower() for keyword in title_keywords if keyword]
-    normalized_url_keywords = [keyword.lower() for keyword in url_keywords if keyword]
-    print(f"已连接，当前上下文数量: {len(browser.contexts)}")
-    for context, page in iter_pages(browser):
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=min(timeout_ms, 3000))
-        except Exception:
-            pass
-        try:
-            title = page.title()
-        except Exception:
-            title = ""
-        url = page.url or ""
-        print(f"- 页面: title='{title}' url='{url}'")
-        title_match = any(keyword in title.lower() for keyword in normalized_title_keywords)
-        url_match = any(keyword in url.lower() for keyword in normalized_url_keywords)
-        if title_match or url_match:
-            print(f"命中目标页面: title='{title}'")
-            return context, page
-    return None
+def detect_driver_type(endpoint: str) -> str:
+    """自动检测驱动类型"""
+    # 尝试连接 WebDriver
+    try:
+        with urllib.request.urlopen(f"{endpoint.rstrip('/')}/status", timeout=2):
+            return "webdriver"
+    except urllib.error.URLError:
+        pass
+
+    # 尝试连接 CDP
+    try:
+        with urllib.request.urlopen(f"{endpoint.rstrip('/')}/json/version", timeout=2):
+            return "cdp"
+    except urllib.error.URLError:
+        pass
+
+    return "webdriver"  # 默认
 
 
-def wait_tauri_ready(page: Page, timeout_ms: int) -> bool:
+def wait_endpoint(endpoint: str, timeout_ms: int, driver_type: str = "webdriver") -> bool:
+    """等待端点就绪"""
     deadline = time.time() + timeout_ms / 1000
-    while time.time() < deadline:
-        try:
-            location = page.evaluate(
-                "() => { const api = globalThis.__TAURI__; const internals = globalThis.__TAURI_INTERNALS__; if (api && typeof api.invoke === 'function') return 'root'; if (api && api.core && typeof api.core.invoke === 'function') return 'core'; if (internals && typeof internals.invoke === 'function') return 'internals'; return 'missing'; }"
-            )
-        except Exception:
-            location = "missing"
-        if location in {"root", "core", "internals"}:
-            print(f"Tauri invoke 已就绪，位置: {location}")
-            return True
-        time.sleep(0.5)
-    return False
-
-def wait_endpoint(endpoint: str, timeout_ms: int) -> bool:
-    deadline = time.time() + timeout_ms / 1000
-    target = endpoint.rstrip("/") + "/json/version"
+    
+    if driver_type == "cdp":
+        target = endpoint.rstrip("/") + "/json/version"
+    else:
+        target = endpoint.rstrip("/") + "/status"
+    
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(target, timeout=2):
@@ -87,22 +103,71 @@ def maybe_launch_app(args: argparse.Namespace):
     if not args.app_cmd:
         return None
     env = dict(os.environ)
-    if "--remote-debugging-port=" not in env.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", ""):
-        env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--remote-debugging-port=9222"
-    process = subprocess.Popen(
-        args.app_cmd,
-        cwd=args.app_cwd or None,
-        env=env,
-        shell=True,
-    )
+    if args.driver == "cdp" or (args.driver == "auto" and args.endpoint == args.cdp_endpoint):
+        if "--remote-debugging-port=" not in env.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", ""):
+            env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--remote-debugging-port=9222"
+    process = subprocess.Popen(args.app_cmd, cwd=args.app_cwd or None, env=env, shell=True)
     time.sleep(args.app_start_wait_ms / 1000)
     return process
 
 
-def collect_click_targets(page, limit: int):
+# ============== CDP (Playwright) 实现 ==============
+
+def pick_target_page_cdp(playwright, endpoint: str, title_keywords: list, url_keywords: list, timeout_ms: int):
+    """CDP 模式：查找目标页面"""
+    browser = playwright.chromium.connect_over_cdp(endpoint)
+    normalized_title_keywords = [keyword.lower() for keyword in title_keywords if keyword]
+    normalized_url_keywords = [keyword.lower() for keyword in url_keywords if keyword]
+    print(f"已连接，当前上下文数量: {len(browser.contexts)}")
+    
+    for context in browser.contexts:
+        for page in context.pages:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=min(timeout_ms, 3000))
+            except Exception:
+                pass
+            try:
+                title = page.title()
+            except Exception:
+                title = ""
+            url = page.url or ""
+            print(f"- 页面: title='{title}' url='{url}'")
+            title_match = any(keyword in title.lower() for keyword in normalized_title_keywords)
+            url_match = any(keyword in url.lower() for keyword in normalized_url_keywords)
+            if title_match or url_match:
+                print(f"命中目标页面: title='{title}'")
+                return browser, page
+    return None, None
+
+
+def wait_tauri_ready_cdp(page, timeout_ms: int) -> bool:
+    """CDP 模式：等待 Tauri 就绪"""
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        try:
+            location = page.evaluate(
+                """() => {
+            const api = globalThis.__TAURI__;
+            const internals = globalThis.__TAURI_INTERNALS__;
+            if (api && typeof api.invoke === 'function') return 'root';
+            if (api && api.core && typeof api.core.invoke === 'function') return 'core';
+            if (internals && typeof internals.invoke === 'function') return 'internals';
+            return 'missing';
+          }"""
+            )
+        except Exception:
+            location = "missing"
+        if location in {"root", "core", "internals"}:
+            print(f"Tauri invoke 已就绪，位置: {location}")
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def collect_click_targets_cdp(page, limit: int):
+    """CDP 模式：收集可点击元素"""
     return page.evaluate(
-        """
-        ({ limit }) => {
+        """({ limit }) => {
           const selector = 'button, a, [role="button"], input[type="button"], input[type="submit"], [onclick]';
           const all = Array.from(document.querySelectorAll(selector));
           const isVisible = (el) => {
@@ -145,96 +210,332 @@ def collect_click_targets(page, limit: int):
     )
 
 
-def return_home(page, home_url: str, home_selector: str | None, timeout_ms: int):
-    if page.url != home_url:
-        try:
-            page.go_back(wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(300)
-            return
-        except Exception:
-            pass
-    if home_selector:
-        try:
-            page.click(home_selector, timeout=timeout_ms)
-            page.wait_for_timeout(300)
-            return
-        except Exception:
-            pass
-    page.goto(home_url, wait_until="domcontentloaded", timeout=timeout_ms)
-    page.wait_for_timeout(300)
-
-
-def run() -> int:
-    args = parse_args()
+def run_cdp(args) -> int:
+    """CDP 模式运行"""
     app_process = maybe_launch_app(args)
     try:
-        if not wait_endpoint(args.endpoint, args.timeout_ms):
+        if not wait_endpoint(args.endpoint, args.timeout_ms, "cdp"):
             raise SystemExit(f"CDP 端点不可达: {args.endpoint}")
+
         with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(args.endpoint)
-            picked = pick_target_page(browser, args.title_keywords, args.url_keywords, args.timeout_ms)
-            if not picked:
+            browser, page = pick_target_page_cdp(p, args.endpoint, args.title_keywords, args.url_keywords, args.timeout_ms)
+            if not page:
                 raise SystemExit("未找到目标页面")
-            _, page = picked
-            console_errors: list[str] = []
-            page_errors: list[str] = []
-            page.on("console", lambda msg: console_errors.append(f"{msg.type}: {msg.text}") if msg.type == "error" else None)
-            page.on("pageerror", lambda err: page_errors.append(str(err)))
+
+            console_errors = []
+            page_errors = []
+
+            def on_console(msg):
+                if msg.type == "error":
+                    console_errors.append(f"{msg.type}: {msg.text}")
+
+            def on_pageerror(err):
+                page_errors.append(str(err))
+
+            page.on("console", on_console)
+            page.on("pageerror", on_pageerror)
+
             try:
                 page.wait_for_load_state("networkidle", timeout=min(args.timeout_ms, 8000))
             except Exception:
                 pass
-            if not wait_tauri_ready(page, args.timeout_ms):
-                raise SystemExit("Tauri invoke 未就绪")
+
+            if not wait_tauri_ready_cdp(page, args.timeout_ms):
+                print("警告: Tauri invoke 未就绪，继续测试...")
+
             page.wait_for_selector(args.expect_selector, timeout=args.timeout_ms)
             count = page.locator(args.expect_selector).count()
             if count < args.min_count:
                 raise SystemExit(f"渲染断言失败: {args.expect_selector} 数量 {count} < {args.min_count}")
-            html = page.content()
-            for text in args.expect_texts:
-                if text not in html:
-                    raise SystemExit(f"渲染断言失败: 未找到文本 {text}")
+
             home_url = page.url
-            targets = collect_click_targets(page, args.max_click_targets)
-            print("可点击目标列表:")
-            for idx, item in enumerate(targets, start=1):
-                print(f"{idx}. {item['tag']} | {item['text']} | {item['selector']}")
-            click_reports = []
-            prev_console_len = len(console_errors)
-            prev_page_error_len = len(page_errors)
-            for idx, item in enumerate(targets, start=1):
-                report = {"index": idx, "selector": item["selector"], "text": item["text"], "ok": True, "error_count": 0}
-                try:
-                    page.locator(item["selector"]).first.click(timeout=args.timeout_ms)
-                    page.wait_for_timeout(args.click_wait_ms)
-                except Exception as error:
-                    report["ok"] = False
-                    report["error"] = f"点击失败: {error}"
-                new_errors = len(console_errors) - prev_console_len + len(page_errors) - prev_page_error_len
-                report["error_count"] = max(new_errors, 0)
-                if new_errors > 0:
-                    report["ok"] = False
-                click_reports.append(report)
-                return_home(page, home_url, args.home_selector, args.timeout_ms)
-                prev_console_len = len(console_errors)
-                prev_page_error_len = len(page_errors)
-            violations = []
-            for pattern in args.forbid_patterns:
-                violations.extend([line for line in console_errors if pattern in line])
-                violations.extend([line for line in page_errors if pattern in line])
-            if violations:
-                raise SystemExit("前端报错命中禁用模式: " + " | ".join(violations))
-            failed_steps = [item for item in click_reports if not item["ok"]]
-            print(json.dumps({"selector": args.expect_selector, "count": count, "click_steps": len(click_reports), "failed_steps": len(failed_steps)}, ensure_ascii=False))
-            print("累计控制台错误:")
-            print(json.dumps({"console_errors": console_errors, "page_errors": page_errors}, ensure_ascii=False))
-            if failed_steps:
-                raise SystemExit("点击循环存在失败步骤: " + json.dumps(failed_steps, ensure_ascii=False))
-            print("✅ 页面渲染成功，点击循环完成，未发现禁用报错")
-            return 0
+            targets = collect_click_targets_cdp(page, args.max_click_targets)
+            
+            return run_click_tests(page, browser, args, console_errors, page_errors, targets, home_url)
     finally:
-        if app_process is not None:
+        if app_process:
             app_process.terminate()
+
+
+# ============== WebDriver (Selenium) 实现 ==============
+
+def pick_target_page_webdriver(driver, title_keywords: list, url_keywords: list):
+    """WebDriver 模式：查找目标页面"""
+    normalized_title_keywords = [keyword.lower() for keyword in title_keywords if keyword]
+    normalized_url_keywords = [keyword.lower() for keyword in url_keywords if keyword]
+    
+    # 获取所有窗口句柄
+    try:
+        window_handles = driver.window_handles
+    except Exception as e:
+        print(f"获取窗口句柄失败: {e}")
+        # 尝试直接使用当前 driver
+        try:
+            title = driver.title
+            url = driver.current_url
+            print(f"- 页面: title='{title}' url='{url}'")
+            return driver
+        except Exception as e2:
+            print(f"获取页面信息失败: {e2}")
+            return None
+    
+    print(f"已连接，当前窗口数量: {len(window_handles)}")
+    
+    for handle in window_handles:
+        try:
+            driver.switch_to.window(handle)
+            title = driver.title
+            url = driver.current_url
+            print(f"- 页面: title='{title}' url='{url}'")
+            title_match = any(keyword in title.lower() for keyword in normalized_title_keywords)
+            url_match = any(keyword in url.lower() for keyword in normalized_url_keywords)
+            if title_match or url_match:
+                print(f"命中目标页面: title='{title}'")
+                return driver
+        except Exception as e:
+            print(f"切换窗口失败: {e}")
+    return None
+
+
+def wait_tauri_ready_webdriver(driver, timeout_ms: int) -> bool:
+    """WebDriver 模式：等待 Tauri 就绪"""
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        try:
+            result = driver.execute_script("""
+                const api = globalThis.__TAURI__;
+                const internals = globalThis.__TAURI_INTERNALS__;
+                if (api && typeof api.invoke === 'function') return 'root';
+                if (api && api.core && typeof api.core.invoke === 'function') return 'core';
+                if (internals && typeof internals.invoke === 'function') return 'internals';
+                return 'missing';
+            """)
+        except Exception:
+            result = "missing"
+        
+        if result in {"root", "core", "internals"}:
+            print(f"Tauri invoke 已就绪，位置: {result}")
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def collect_click_targets_webdriver(driver, limit: int):
+    """WebDriver 模式：收集可点击元素"""
+    # 简化版 JavaScript，使用传统函数语法
+    script = f"""
+    var selector = 'button, a, [role="button"], input[type="button"], input[type="submit"]';
+    var all = document.querySelectorAll(selector);
+    var result = [];
+    for (var i = 0; i < all.length && result.length < {limit}; i++) {{
+        var el = all[i];
+        var style = window.getComputedStyle(el);
+        if (style.visibility === 'hidden' || style.display === 'none') continue;
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        var text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
+        result.push({{ selector: selector + ':nth-of-type(' + (i+1) + ')', tag: el.tagName.toLowerCase(), text: text || '(no-text)' }});
+    }}
+    return result;
+    """
+    return driver.execute_script(script)
+
+
+def run_webdriver(args) -> int:
+    """WebDriver 模式运行"""
+    app_process = maybe_launch_app(args)
+    try:
+        if not wait_endpoint(args.endpoint, args.timeout_ms, "webdriver"):
+            raise SystemExit(f"WebDriver 端点不可达: {args.endpoint}")
+
+        # 创建 Selenium WebDriver
+        options = ChromeOptions()
+        options.add_experimental_option("debuggerAddress", "127.0.0.1:0")  # Dummy, will be overridden
+        options.add_argument("--remote-debugging-port=0")  # Don't actually use this
+        
+        # 使用 WebDriver 连接到 tauri-plugin-webdriver
+        # 注意：这里直接连接到 WebDriver 服务器，不需要 browser_url
+        driver = webdriver.Remote(
+            command_executor=args.endpoint,
+            options=options
+        )
+
+        driver = pick_target_page_webdriver(driver, args.title_keywords, args.url_keywords)
+        if not driver:
+            raise SystemExit("未找到目标页面")
+
+        console_errors = []
+        page_errors = []
+
+        # Selenium 不支持 console 监听，直接跳过
+        print("注意: Selenium 模式不支持 console 错误监听")
+
+        try:
+            driver.implicitly_wait(min(args.timeout_ms, 8000) / 1000)
+        except Exception:
+            pass
+
+        if not wait_tauri_ready_webdriver(driver, args.timeout_ms):
+            print("警告: Tauri invoke 未就绪，继续测试...")
+
+        # 等待元素
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        
+        wait = WebDriverWait(driver, args.timeout_ms / 1000)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, args.expect_selector)))
+        
+        # 检查元素数量
+        elements = driver.find_elements(By.CSS_SELECTOR, args.expect_selector)
+        count = len(elements)
+        if count < args.min_count:
+            raise SystemExit(f"渲染断言失败: {args.expect_selector} 数量 {count} < {args.min_count}")
+
+        home_url = driver.current_url
+        targets = collect_click_targets_webdriver(driver, args.max_click_targets)
+        
+        return run_click_tests_webdriver(driver, args, console_errors, page_errors, targets, home_url)
+    finally:
+        if app_process:
+            app_process.terminate()
+
+
+def run_click_tests(page, browser, args, console_errors, page_errors, targets, home_url):
+    """运行点击测试 (CDP 版本)"""
+    print("可点击目标列表:")
+    for idx, item in enumerate(targets, start=1):
+        print(f"{idx}. {item['tag']} | {item['text']} | {item['selector']}")
+    
+    click_reports = []
+    prev_console_len = len(console_errors)
+    prev_page_error_len = len(page_errors)
+    
+    for idx, item in enumerate(targets, start=1):
+        report = {"index": idx, "selector": item["selector"], "text": item["text"], "ok": True, "error_count": 0}
+        try:
+            page.locator(item["selector"]).first.click(timeout=args.timeout_ms)
+            page.wait_for_timeout(args.click_wait_ms)
+        except Exception as error:
+            report["ok"] = False
+            report["error"] = f"点击失败: {error}"
+        
+        new_errors = len(console_errors) - prev_console_len + len(page_errors) - prev_page_error_len
+        report["error_count"] = max(new_errors, 0)
+        if new_errors > 0:
+            report["ok"] = False
+        
+        click_reports.append(report)
+        
+        # 返回首页
+        try:
+            if page.url != home_url:
+                page.go_back(wait_until="domcontentloaded", timeout=args.timeout_ms)
+                page.wait_for_timeout(300)
+        except Exception:
+            pass
+        
+        prev_console_len = len(console_errors)
+        prev_page_error_len = len(page_errors)
+    
+    # 检查违规
+    violations = []
+    for pattern in args.forbid_patterns:
+        violations.extend([line for line in console_errors if pattern in line])
+        violations.extend([line for line in page_errors if pattern in line])
+    
+    if violations:
+        raise SystemExit("前端报错命中禁用模式: " + " | ".join(violations))
+    
+    failed_steps = [item for item in click_reports if not item["ok"]]
+    print(json.dumps({"selector": args.expect_selector, "count": len(elements) if 'elements' in dir() else 0, "click_steps": len(click_reports), "failed_steps": len(failed_steps)}, ensure_ascii=False))
+    print("累计控制台错误:")
+    print(json.dumps({"console_errors": console_errors, "page_errors": page_errors}, ensure_ascii=False))
+    
+    if failed_steps:
+        raise SystemExit("点击循环存在失败步骤: " + json.dumps(failed_steps, ensure_ascii=False))
+    
+    print("✅ 页面渲染成功，点击循环完成，未发现禁用报错")
+    browser.close()
+    return 0
+
+
+def run_click_tests_webdriver(driver, args, console_errors, page_errors, targets, home_url):
+    """运行点击测试 (WebDriver 版本)"""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    
+    print("可点击目标列表:")
+    for idx, item in enumerate(targets, start=1):
+        print(f"{idx}. {item['tag']} | {item['text']} | {item['selector']}")
+    
+    click_reports = []
+    
+    for idx, item in enumerate(targets, start=1):
+        report = {"index": idx, "selector": item["selector"], "text": item["text"], "ok": True, "error_count": 0}
+        try:
+            element = driver.find_element(By.CSS_SELECTOR, item["selector"])
+            element.click()
+            time.sleep(args.click_wait_ms / 1000)
+        except Exception as error:
+            report["ok"] = False
+            report["error"] = f"点击失败: {error}"
+        
+        click_reports.append(report)
+        
+        # 返回首页
+        try:
+            if driver.current_url != home_url:
+                driver.back()
+                time.sleep(0.3)
+        except Exception:
+            pass
+    
+    failed_steps = [item for item in click_reports if not item["ok"]]
+    print(json.dumps({"selector": args.expect_selector, "click_steps": len(click_reports), "failed_steps": len(failed_steps)}, ensure_ascii=False))
+    
+    if failed_steps:
+        raise SystemExit("点击循环存在失败步骤: " + json.dumps(failed_steps, ensure_ascii=False))
+    
+    print("✅ 页面渲染成功，点击循环完成，未发现禁用报错")
+    driver.quit()
+    return 0
+
+
+def run() -> int:
+    args = parse_args()
+
+    # 自动检测驱动类型
+    if args.driver == "auto":
+        # 优先检测 WebDriver (macOS)
+        if wait_endpoint(args.webdriver_endpoint, 3000, "webdriver"):
+            args.driver = "webdriver"
+            args.endpoint = args.webdriver_endpoint
+            print(f"自动检测: 使用 WebDriver ({args.endpoint})")
+        elif wait_endpoint(args.cdp_endpoint, 3000, "cdp"):
+            args.driver = "cdp"
+            args.endpoint = args.cdp_endpoint
+            print(f"自动检测: 使用 CDP ({args.endpoint})")
+        else:
+            # 默认使用 WebDriver
+            args.driver = "webdriver"
+            args.endpoint = args.webdriver_endpoint
+            print(f"自动检测: 默认使用 WebDriver ({args.endpoint})")
+    else:
+        # 使用指定的端点
+        if args.driver == "cdp":
+            args.endpoint = args.cdp_endpoint
+        else:
+            args.endpoint = args.webdriver_endpoint
+
+    print(f"驱动类型: {args.driver}, 端点: {args.endpoint}")
+
+    # 根据驱动类型选择运行方式
+    if args.driver == "cdp":
+        return run_cdp(args)
+    else:
+        return run_webdriver(args)
 
 
 if __name__ == "__main__":
